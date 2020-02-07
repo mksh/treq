@@ -8,6 +8,7 @@ from twisted.internet.task import deferLater
 from twisted.internet import reactor
 from twisted.internet.tcp import Client
 from twisted.internet.ssl import Certificate, trustRootFromCertificates
+from twisted.python.monkey import MonkeyPatcher
 
 from twisted.web.client import (Agent, BrowserLikePolicyForHTTPS,
                                 HTTPConnectionPool, ResponseFailed)
@@ -17,6 +18,7 @@ from treq.test.util import DEBUG, skip_on_windows_because_of_199
 from .local_httpbin.parent import _HTTPBinProcess
 
 import treq
+from treq.auth import HTTPDigestAuth, UnknownQopForDigestAuth
 
 
 skip = skip_on_windows_because_of_199()
@@ -239,6 +241,154 @@ class TreqIntegrationTests(TestCase):
                                   auth=('not-treq', 'not-treq'))
         self.assertEqual(response.code, 401)
         yield print_response(response)
+
+    @inlineCallbacks
+    def test_digest_auth(self):
+        """
+            Test successful Digest authentication
+        :return:
+        """
+        response = yield self.get('/digest-auth/auth/treq/treq',
+                                  auth=HTTPDigestAuth('treq', 'treq'))
+        self.assertEqual(response.code, 200)
+        yield print_response(response)
+        json = yield treq.json_content(response)
+        self.assertTrue(json['authenticated'])
+        self.assertEqual(json['user'], 'treq')
+
+    @inlineCallbacks
+    def test_digest_auth_multi_qop(self):
+        """
+            Test successful Digest authentication with multiple qop types
+        :return:
+        """
+        response = yield self.get('/digest-auth/undefined/treq/treq',
+                                  auth=HTTPDigestAuth('treq', 'treq'))
+        self.assertEqual(response.code, 200)
+        yield print_response(response)
+        json = yield treq.json_content(response)
+        self.assertTrue(json['authenticated'])
+        self.assertEqual(json['user'], 'treq')
+
+    @inlineCallbacks
+    def test_digest_auth_multiple_calls(self):
+        """
+            Test proper Digest authentication credentials caching
+        """
+
+        # A mutable holder for call counter
+        agent_request_call_storage = {
+            'c': 0,
+            'i': []
+        }
+
+        # Original Agent request call
+        agent_request_orig = Agent.request
+
+        def agent_request_patched(*args, **kwargs):
+            """
+                Patched Agent.request function,
+                that inscreaces call count on every HTTP request
+                and appends
+            """
+            response_deferred = agent_request_orig(*args, **kwargs)
+            agent_request_call_storage['c'] += 1
+            agent_request_call_storage['i'].append((args, kwargs))
+            return response_deferred
+
+        patcher = MonkeyPatcher(
+            (Agent, 'request', agent_request_patched)
+        )
+        patcher.patch()
+
+        response1 = yield self.get(
+            '/digest-auth/auth/treq-digest-auth-multiple/treq',
+            auth=HTTPDigestAuth('treq-digest-auth-multiple', 'treq')
+        )
+        self.assertEqual(response1.code, 200)
+        yield print_response(response1)
+        json1 = yield treq.json_content(response1)
+
+        # Assume we did two actual HTTP requests - one to obtain credentials
+        # and second is original request with authentication
+        self.assertEqual(
+            agent_request_call_storage['c'],
+            2
+        )
+        headers_for_second_request = agent_request_call_storage['i'][1][0][3]
+        self.assertIn(
+            b'Authorization',
+            dict(headers_for_second_request.getAllRawHeaders())
+        )
+
+        response2 = yield self.get(
+            '/digest-auth/auth/treq-digest-auth-multiple/treq',
+            auth=HTTPDigestAuth('treq-digest-auth-multiple', 'treq'),
+            cookies=response1.cookies()
+        )
+        self.assertEqual(response2.code, 200)
+        yield print_response(response2)
+        json2 = yield treq.json_content(response2)
+        self.assertTrue(json1['authenticated'])
+        self.assertEqual(json1['user'], 'treq-digest-auth-multiple')
+
+        # Assume that responses are the same
+        self.assertEqual(json1, json2)
+
+        # Assume we need only one call to obtain second response
+        self.assertEqual(
+            agent_request_call_storage['c'],
+            3
+        )
+        patcher.restore()
+
+    @inlineCallbacks
+    def test_digest_auth_sha256(self):
+        """
+            Test successful Digest authentication with sha256
+        :return:
+        """
+        response = yield self.get('/digest-auth/auth/treq/treq/SHA-256',
+                                  auth=HTTPDigestAuth('treq', 'treq'))
+        self.assertEqual(response.code, 200)
+        yield print_response(response)
+        json = yield treq.json_content(response)
+        self.assertTrue(json['authenticated'])
+        self.assertEqual(json['user'], 'treq')
+
+    @inlineCallbacks
+    def test_digest_auth_sha512(self):
+        """
+            Test successful Digest authentication with sha512
+        :return:
+        """
+        response = yield self.get('/digest-auth/auth/treq/treq/SHA-512',
+                                  auth=HTTPDigestAuth('treq', 'treq'))
+        self.assertEqual(response.code, 200)
+        yield print_response(response)
+        json = yield treq.json_content(response)
+        self.assertTrue(json['authenticated'])
+        self.assertEqual(json['user'], 'treq')
+
+    @inlineCallbacks
+    def test_failed_digest_auth(self):
+        """
+            Test digest auth with invalid credentials
+        """
+        response = yield self.get('/digest-auth/auth/treq/treq',
+                                  auth=HTTPDigestAuth('not-treq', 'not-treq'))
+        self.assertEqual(response.code, 401)
+        yield print_response(response)
+
+    @inlineCallbacks
+    def test_failed_digest_auth_int(self):
+        """
+            Test failed Digest authentication when qop type is unsupported
+        :return:
+        """
+        with self.assertRaises(UnknownQopForDigestAuth):
+            yield self.get('/digest-auth/auth-int/treq/treq',
+                           auth=HTTPDigestAuth('treq', 'treq'))
 
     @inlineCallbacks
     def test_timeout(self):
